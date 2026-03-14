@@ -53,12 +53,8 @@ app = FastAPI(title="RepoGuardian AI", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL", "http://localhost:5173"),
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -97,6 +93,8 @@ class RepoAnalyzeRequest(BaseModel):
     has_readme:      bool          = False
     has_license:     bool          = False
     has_security_md: bool          = False
+    has_wiki:        bool          = False
+    repo_name:       Optional[str] = None
     file_context:    str           = ""
     tree:            List[str]     = []
 
@@ -299,15 +297,125 @@ def _rule_based_analysis(file_context: str, tree: List[str], req) -> dict:
             "code_example": "# Project Name\n\n## Setup\n```bash\npip install -r requirements.txt\n```\n\n## Usage\n...",
         })
 
+
+    # ── Metadata-based findings (always run, even with no file content) ──────
+    lang = (req.language or "").lower()
+    name_r = f"{req.owner}/{req.repo}"
+
+    if not req.has_tests:
+        findings.append({
+            "id": nid(), "severity": "MEDIUM", "category": "Quality",
+            "title": "No Automated Tests Detected",
+            "description": f"{name_r} has no test files. Code without tests is fragile — bugs reach production undetected.",
+            "file": "Repository root",
+            "fix": "Create a tests/ directory and write unit tests for your core functions.",
+            "code_example": (
+                "// tests/app.test.js\ntest('example', () => {\n  expect(1+1).toBe(2);\n});"
+                if "javascript" in lang or "typescript" in lang
+                else "# tests/test_app.py\ndef test_example():\n    assert 1 + 1 == 2"
+            ),
+        })
+
+    if not req.has_ci:
+        findings.append({
+            "id": nid(), "severity": "LOW", "category": "Quality",
+            "title": "No CI/CD Pipeline Found",
+            "description": "No GitHub Actions or other automation detected. Without CI/CD, bugs can reach production and deployments are manual.",
+            "file": "Repository root",
+            "fix": "Add a GitHub Actions workflow to automatically test on every push.",
+            "code_example": "# .github/workflows/ci.yml\nname: CI\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n      - run: npm install && npm test",
+        })
+
+    if not req.has_readme:
+        findings.append({
+            "id": nid(), "severity": "LOW", "category": "Documentation",
+            "title": "Missing README Documentation",
+            "description": "No README found. New contributors have no documentation on how to install or use the project.",
+            "file": "Repository root",
+            "fix": "Create README.md with description, installation steps, and usage examples.",
+            "code_example": "# Project Name\n\n## Installation\n```bash\nnpm install\n```\n\n## Usage\n```bash\nnpm start\n```",
+        })
+
+    if not req.has_license:
+        findings.append({
+            "id": nid(), "severity": "INFO", "category": "Documentation",
+            "title": "No License File",
+            "description": "Without a license, others cannot legally use or contribute to your code.",
+            "file": "Repository root",
+            "fix": "Add a LICENSE file. MIT is a good choice for open source.",
+            "code_example": "MIT License\nCopyright (c) 2025\nPermission is hereby granted...",
+        })
+
+    if not req.has_security_md:
+        findings.append({
+            "id": nid(), "severity": "INFO", "category": "Security",
+            "title": "No SECURITY.md Policy",
+            "description": "No security policy found. Researchers don't know how to safely report vulnerabilities.",
+            "file": "Repository root",
+            "fix": "Create SECURITY.md with your contact and responsible disclosure process.",
+            "code_example": "# Security Policy\n## Reporting a Vulnerability\nEmail: security@yourproject.com",
+        })
+
+    if req.open_issues > 10:
+        findings.append({
+            "id": nid(), "severity": "MEDIUM", "category": "Quality",
+            "title": f"High Open Issue Count ({req.open_issues} open)",
+            "description": f"{req.open_issues} open issues indicates a large backlog of technical debt.",
+            "file": "GitHub Issues",
+            "fix": "Triage all open issues. Close stale ones. Create a milestone for the next release.",
+            "code_example": "",
+        })
+
+    if not sections:
+        if "javascript" in lang or "typescript" in lang:
+            findings.append({
+                "id": nid(), "severity": "MEDIUM", "category": "Security",
+                "title": "Verify No Hardcoded API Keys in JavaScript",
+                "description": "JavaScript projects commonly expose API keys in frontend code. Any secret in client-side JS is visible to all users.",
+                "file": "Check all .js/.ts files",
+                "fix": "Use environment variables. Never commit .env files.",
+                "code_example": "// .gitignore\n.env\n\n// In code:\nconst apiKey = process.env.REACT_APP_API_KEY;",
+            })
+        elif "python" in lang:
+            findings.append({
+                "id": nid(), "severity": "MEDIUM", "category": "Security",
+                "title": "Verify No Hardcoded Credentials in Python Files",
+                "description": "Python projects frequently store passwords and API keys as string literals in config files.",
+                "file": "Check config.py, settings.py",
+                "fix": "Use os.getenv() and python-dotenv. Add .env to .gitignore.",
+                "code_example": "import os\nfrom dotenv import load_dotenv\nload_dotenv()\nSECRET_KEY = os.getenv('SECRET_KEY')",
+            })
+        elif "java" in lang:
+            findings.append({
+                "id": nid(), "severity": "MEDIUM", "category": "Security",
+                "title": "Verify No Credentials in application.properties",
+                "description": "Java/Spring projects often store credentials in application.properties accidentally.",
+                "file": "Check application.properties",
+                "fix": "Use Spring environment variables. Never commit real credentials.",
+                "code_example": "# application.properties\nspring.datasource.password=${DB_PASSWORD}",
+            })
+
+    # Deduplicate by title
+    seen_titles = set()
+    deduped = []
+    for f in findings:
+        if f["title"] not in seen_titles:
+            seen_titles.add(f["title"])
+            deduped.append(f)
+    findings = deduped
+
     # Calculate scores
     def deduct(items, category):
         w = {"CRITICAL": 20, "HIGH": 12, "MEDIUM": 6, "LOW": 2}
         return sum(w.get(f["severity"], 0) for f in items if f["category"] == category)
 
+    _has_tests  = req.has_tests or bool(test_files)
+    _has_ci     = req.has_ci   or has_ci
+    _has_readme = req.has_readme or has_readme
     sec_score  = max(0, min(100, 100 - deduct(findings, "Security")))
-    qual_score = max(0, min(100, (80 if test_files else 55) - deduct(findings, "Quality")))
-    dep_score  = max(0, min(100, (85 if has_ci else 75) - deduct(findings, "Dependency")))
-    doc_score  = max(0, min(100, (70 if has_readme else 45) - deduct(findings, "Documentation")))
+    qual_score = max(0, min(100, (80 if _has_tests else 55) - deduct(findings, "Quality")))
+    dep_score  = max(0, min(100, (85 if _has_ci   else 75) - deduct(findings, "Dependency")))
+    doc_score  = max(0, min(100, (70 if _has_readme else 45) - deduct(findings, "Documentation")))
     health     = round(sec_score*0.35 + qual_score*0.30 + dep_score*0.20 + doc_score*0.15)
 
     status = "Healthy" if health >= 80 else "Moderate" if health >= 60 else "Degraded" if health >= 40 else "At Risk"
@@ -425,16 +533,16 @@ def get_health_status(repo_url: Optional[str] = None):
 async def analyze_repo(req: RepoAnalyzeRequest):
     """
     Main frontend endpoint.
-    1. Empty repo -> instant result
-    2. Anthropic key + credits -> Claude AI
-    3. Fallback -> built-in rule-based engine
+    1. Anthropic key + credits -> Claude AI
+    2. Fallback -> built-in rule-based engine (always works)
     """
+    # Handle legacy repo_name field
+    if req.repo_name and req.owner == "unknown":
+        parts = req.repo_name.split("/")
+        req.owner = parts[0] if len(parts) >= 2 else "unknown"
+        req.repo  = parts[1] if len(parts) >= 2 else req.repo_name
 
-    # 1. Empty
-    if req.is_empty or req.file_count == 0:
-        return _empty_result(req)
-
-    # 2. Try Anthropic
+    # 1. Try Anthropic
     api_key = os.getenv("ANTHROPIC_API_KEY","").strip()
     if api_key and not api_key.startswith("sk-ant-your"):
         try:
