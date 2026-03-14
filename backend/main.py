@@ -1,484 +1,563 @@
 """
-main.py  –  RepoGuardian AI  –  FastAPI Backend
-────────────────────────────────────────────────
-Routes:
-  POST /analyze-repo   – AI repo analysis (proxies Anthropic, falls back to rule-based)
-  POST /analyze        – trigger multi-agent analysis
-  GET  /health         – repository health score + breakdown
-  POST /simulation     – digital twin blast-radius simulation
-  GET  /quantum-risk   – quantum-inspired file risk ranking
-  GET  /agent-logs     – streaming agent thought log
-  GET  /ping           – health check
+main.py  -  RepoGuardian AI  -  FastAPI Backend v3.3
+-----------------------------------------------------
+Self-contained: rule-based engine is built directly into this file.
+NO external analyzer.py needed. Drop this single file and restart.
+
+Analysis priority:
+  1. Empty repo  -> instant clean result
+  2. ANTHROPIC_API_KEY set + credits -> Claude AI
+  3. Anything else -> built-in rule-based engine (no credits needed)
 """
 
-import os
-import json
-import asyncio
-import httpx
-from typing import Optional
+import os, re, json, asyncio
+from typing import Optional, List
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import requests
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
 from dotenv import load_dotenv
-
-from agents import analyse_repository, AnalysisResult, run_mock_analysis, MOCK_AGENT_LOGS
-from quantum_risk import calculate_quantum_risk
-from digital_twin import build_mock_graph, simulate_impact
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────
-# App setup
-# ─────────────────────────────────────────────────────────
+# --- safe imports (these files may or may not exist) ----------------------
+try:
+    from agents import analyse_repository, AnalysisResult, MOCK_AGENT_LOGS
+    _AGENTS_OK = True
+except ImportError:
+    _AGENTS_OK = False
+    MOCK_AGENT_LOGS = [
+        {"agent": "Orchestrator", "msg": "System ready.", "status": "success"}
+    ]
 
-app = FastAPI(
-    title="RepoGuardian AI",
-    description="Autonomous multi-agent code repository security & quality platform",
-    version="2.0.0",
-)
+try:
+    from quantum_risk import calculate_quantum_risk
+    _QR_OK = True
+except ImportError:
+    _QR_OK = False
+
+try:
+    from digital_twin import build_mock_graph, simulate_impact
+    _DT_OK = True
+except ImportError:
+    _DT_OK = False
+
+# ==========================================================================
+# App setup
+# ==========================================================================
+
+app = FastAPI(title="RepoGuardian AI", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # allow all origins in dev
-    allow_credentials=False,
+    allow_origins=[
+        os.getenv("FRONTEND_URL", "http://localhost:5173"),
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-_analysis_cache: dict = {}
+_cache: dict = {}
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-# ─────────────────────────────────────────────────────────
+# ==========================================================================
 # Schemas
-# ─────────────────────────────────────────────────────────
+# ==========================================================================
 
 class AnalyzeRequest(BaseModel):
-    repo_url:  str
-    use_mock:  bool = True
+    repo_url: str
+    use_mock: bool = True
 
 class SimulationRequest(BaseModel):
     changed_file: str
-    repo_url:     Optional[str] = None
+    repo_url: Optional[str] = None
 
 class RepoAnalyzeRequest(BaseModel):
-    repo_name:    str
-    language:     Optional[str] = "Unknown"
-    stars:        Optional[int] = 0
-    open_issues:  Optional[int] = 0
-    size:         Optional[int] = 0
-    topics:       Optional[list] = []
-    description:  Optional[str] = ""
-    default_branch: Optional[str] = "main"
-    has_wiki:     Optional[bool] = False
-    archived:     Optional[bool] = False
+    owner:           str
+    repo:            str
+    language:        Optional[str] = None
+    size:            int           = 0
+    stars:           int           = 0
+    forks:           int           = 0
+    open_issues:     int           = 0
+    description:     Optional[str] = None
+    default_branch:  str           = "main"
+    topics:          List[str]     = []
+    archived:        bool          = False
+    is_empty:        bool          = False
+    file_count:      int           = 0
+    has_tests:       bool          = False
+    has_ci:          bool          = False
+    has_docker:      bool          = False
+    has_readme:      bool          = False
+    has_license:     bool          = False
+    has_security_md: bool          = False
+    file_context:    str           = ""
+    tree:            List[str]     = []
+
+# ==========================================================================
+# Built-in Rule-Based Analysis Engine
+# (works with ZERO API keys - scans real file content)
+# ==========================================================================
+
+# Security vulnerability patterns
+_SEC = [
+    (r'(?i)(password|secret|api_key|apikey|token|passwd)\s*=\s*["\'][^"\']{4,}["\']',
+     "CRITICAL","Hardcoded Secret",
+     "A credential is hardcoded in source code.",
+     "Use env vars: os.environ.get('KEY_NAME')"),
+    (r'(?i)(execute|cursor\.execute)\s*\([f"\'].*?(%s|\{|format)',
+     "HIGH","SQL Injection Risk",
+     "User input may be interpolated directly into a SQL query.",
+     "Use parameterised queries: cursor.execute('SELECT * FROM t WHERE id=?', (val,))"),
+    (r'\b(eval|exec)\s*\(',
+     "HIGH","Dangerous eval/exec",
+     "eval() or exec() can run arbitrary code.",
+     "Use ast.literal_eval() for safe data evaluation."),
+    (r'(?i)(md5|sha1)\s*\(',
+     "MEDIUM","Weak Cryptographic Hash",
+     "MD5/SHA-1 are broken for security use.",
+     "Use hashlib.sha256() or bcrypt for passwords."),
+    (r'(?i)DEBUG\s*=\s*True|app\.run\s*\(.*debug\s*=\s*True',
+     "HIGH","Debug Mode Enabled",
+     "Debug=True exposes stack traces in production.",
+     "Set DEBUG=False or read from env: os.getenv('DEBUG','False')=='True'"),
+    (r'\bpickle\.(load|loads)\b',
+     "HIGH","Insecure Deserialization",
+     "pickle.load on untrusted data allows code execution.",
+     "Use json.loads() for safe deserialization."),
+    (r'(?i)(os\.system|subprocess\.call|popen)\s*\(.*[\+\%f]',
+     "HIGH","Shell Injection Risk",
+     "Shell command built with string formatting.",
+     "Use subprocess with list args: subprocess.run(['cmd', arg], shell=False)"),
+    (r'http://(?!localhost|127\.0\.0\.1)',
+     "LOW","Insecure HTTP URL",
+     "Plain HTTP used for external request.",
+     "Replace http:// with https://"),
+    (r'(?i)(print|logger\.(debug|info))\s*\(.*?(password|token|secret)',
+     "MEDIUM","Sensitive Data Logged",
+     "Passwords or secrets may appear in logs.",
+     "Remove sensitive fields from log statements."),
+]
+
+# Known vulnerable Python packages {pkg: (safe_prefix, CVE, severity, note)}
+_PY_VULNS = {
+    "flask":        ("2.3","CVE-2023-30861","HIGH","Session cookie not invalidated"),
+    "django":       ("4.2","CVE-2023-36053","HIGH","ReDoS in EmailValidator"),
+    "requests":     ("2.31","CVE-2023-32681","MEDIUM","Proxy-Auth header leak"),
+    "pillow":       ("10.0","CVE-2023-44271","HIGH","Uncontrolled resource use"),
+    "werkzeug":     ("2.3","CVE-2023-46136","HIGH","DoS via multipart parsing"),
+    "pyyaml":       ("6.0","CVE-2022-1471","HIGH","Code execution via yaml.load()"),
+    "urllib3":      ("2.0","CVE-2023-45803","MEDIUM","Cookie redirect leak"),
+    "gunicorn":     ("22.0","CVE-2024-1135","HIGH","HTTP Request Smuggling"),
+    "setuptools":   ("70.0","CVE-2024-6345","HIGH","Remote code execution"),
+    "cryptography": ("41.0","CVE-2023-49083","HIGH","NULL pointer dereference"),
+    "paramiko":     ("3.4","CVE-2023-48795","HIGH","Terrapin SSH attack"),
+    "sqlalchemy":   ("2.0",None,"MEDIUM","Major version behind - upgrade for security fixes"),
+    "celery":       ("5.3",None,"LOW","Old version - update for patches"),
+}
+
+# Known vulnerable JS packages
+_JS_VULNS = {
+    "axios":        ("1.6","CVE-2023-45857","HIGH","CSRF vulnerability"),
+    "lodash":       ("4.17.21","CVE-2021-23337","HIGH","Command injection"),
+    "express":      ("4.19","CVE-2024-29041","MEDIUM","Open redirect"),
+    "jsonwebtoken": ("9.0","CVE-2022-23529","HIGH","Arbitrary file read"),
+    "semver":       ("7.5.2","CVE-2022-25883","HIGH","ReDoS"),
+    "word-wrap":    ("1.2.4","CVE-2023-26115","HIGH","ReDoS"),
+    "tough-cookie": ("4.1.3","CVE-2023-26136","HIGH","Prototype pollution"),
+    "minimist":     ("1.2.6","CVE-2021-44906","HIGH","Prototype pollution"),
+}
 
 
-# ─────────────────────────────────────────────────────────
-# Rule-based fallback engine (no API key needed)
-# ─────────────────────────────────────────────────────────
+def _rule_based_analysis(file_context: str, tree: List[str], req) -> dict:
+    """Scan real file content with regex patterns. No API key needed."""
+    findings = []
+    fid = [0]
 
-def rule_based_analysis(req: RepoAnalyzeRequest) -> dict:
-    """
-    Produces a rich, deterministic analysis based on repo metadata.
-    Works without any API key — used as fallback when Anthropic is unavailable.
-    """
-    lang = req.language or "Unknown"
-    issues_count = req.open_issues or 0
-    size_kb = req.size or 0
+    def nid():
+        fid[0] += 1
+        return f"f{fid[0]}"
 
-    # Score calculation
-    base = 70
-    if issues_count > 20: base -= 15
-    elif issues_count > 10: base -= 8
-    elif issues_count > 5: base -= 4
-    if size_kb > 10000: base -= 5
-    if req.archived: base -= 20
-    if not req.has_wiki: base -= 3
+    # Split context into sections: ## filename\ncontent
+    sections = {}
+    parts = re.split(r'\n## (.+)\n', file_context)
+    i = 1
+    while i < len(parts) - 1:
+        key = parts[i].strip()
+        val = parts[i + 1] if i + 1 < len(parts) else ""
+        if not key.startswith("File Tree"):
+            sections[key] = val
+        i += 2
 
-    health_score = max(20, min(95, base))
-    security_score = max(30, health_score - 12)
-    quality_score = max(30, health_score - 8)
-    dep_score = max(40, health_score + 5)
-    doc_score = max(25, health_score - 20)
+    files_with_issues = set()
 
-    # Language-specific findings
-    lang_findings = {
-        "Python": [
-            {
-                "id": "p1", "severity": "HIGH", "category": "Security",
-                "title": "Potential hardcoded secrets in configuration",
-                "file": "config.py or settings.py",
-                "what_is_it": "Python projects often store API keys, database passwords, or secret tokens as plain text strings in configuration files.",
-                "why_it_happens": "Early in development, hardcoding credentials is convenient. Developers often forget to move them to environment variables before pushing to version control.",
-                "why_it_matters": "Anyone with read access to your repository — including bots that scan GitHub — can steal and abuse your production credentials, leading to data breaches or unexpected cloud bills.",
-                "how_to_fix": "1. Create a .env file in your project root\n2. Move all secrets there: DB_PASSWORD=mypassword\n3. Add .env to your .gitignore immediately\n4. Use os.getenv('DB_PASSWORD') in your code\n5. Rotate any credentials that may have been exposed",
-                "learn_more": "Study OWASP Top 10 A02:2021 (Cryptographic Failures) and the python-dotenv library documentation",
-                "code_before": "# config.py\nDB_PASSWORD = \"prod_password_123\"\nSECRET_KEY = \"my-jwt-secret\"",
-                "code_after": "# config.py\nimport os\nDB_PASSWORD = os.getenv(\"DB_PASSWORD\")\nSECRET_KEY = os.getenv(\"SECRET_KEY\")\nif not SECRET_KEY:\n    raise ValueError(\"SECRET_KEY env var not set\")",
-            },
-            {
-                "id": "p2", "severity": "HIGH", "category": "Security",
-                "title": "SQL Injection risk in database queries",
-                "file": "database.py or models.py",
-                "what_is_it": "SQL injection occurs when user-provided input is inserted directly into a SQL query string using string concatenation or formatting.",
-                "why_it_happens": "String formatting feels natural when building queries. Many tutorials and older code examples still show this unsafe pattern without warning.",
-                "why_it_matters": "An attacker can input `' OR '1'='1` to bypass login, extract all database records, modify data, or even drop tables entirely.",
-                "how_to_fix": "1. Never use string formatting (%, .format(), f-strings) in SQL queries\n2. Always use parameterized queries — pass values as a separate tuple\n3. Consider using an ORM like SQLAlchemy which handles this automatically\n4. Audit all database calls in your codebase",
-                "learn_more": "Read OWASP Top 10 A03:2021 (Injection) and Python's DB-API 2.0 specification on parameterized queries",
-                "code_before": "# Dangerous\nquery = f\"SELECT * FROM users WHERE username = '{username}'\"\ncursor.execute(query)",
-                "code_after": "# Safe — parameterized query\nquery = \"SELECT * FROM users WHERE username = ?\"\ncursor.execute(query, (username,))",
-            },
-            {
-                "id": "p3", "severity": "MEDIUM", "category": "Quality",
-                "title": "Missing type hints on function signatures",
-                "file": "Multiple Python files",
-                "what_is_it": "Python functions are defined without type annotations, meaning IDEs and static analysis tools cannot catch type-related bugs before runtime.",
-                "why_it_happens": "Type hints were added to Python gradually (PEP 484, Python 3.5+). Many developers learned Python before they were common and haven't adopted them.",
-                "why_it_matters": "Without type hints, a function expecting a string that receives an integer causes a runtime crash. IDEs cannot autocomplete correctly. mypy cannot catch errors before deployment.",
-                "how_to_fix": "1. Add parameter types and return types to all public functions\n2. Run: pip install mypy\n3. Run: mypy your_module.py to catch type errors\n4. Use Optional[str] for parameters that can be None",
-                "learn_more": "Read PEP 484 (Type Hints), PEP 526 (Variable Annotations), and the mypy documentation",
-                "code_before": "def process_user(user_id, data, flag=None):\n    return fetch_user(user_id)",
-                "code_after": "from typing import Optional, Dict, Any\n\ndef process_user(\n    user_id: int,\n    data: Dict[str, Any],\n    flag: Optional[bool] = None\n) -> Optional[dict]:\n    return fetch_user(user_id)",
-            },
-        ],
-        "Java": [
-            {
-                "id": "j1", "severity": "HIGH", "category": "Security",
-                "title": "Potential NullPointerException vulnerabilities",
-                "file": "Multiple Java files",
-                "what_is_it": "Java code that accesses object members without checking for null first will throw a NullPointerException at runtime, crashing the application.",
-                "why_it_happens": "Java returns null for uninitialized objects and failed lookups. Without null checks, code written during happy-path testing works fine but crashes in production.",
-                "why_it_matters": "NPEs are the most common Java runtime exception. They cause unexpected 500 errors, crash worker threads, and can expose stack traces to end users in misconfigured apps.",
-                "how_to_fix": "1. Use Java 8+ Optional<T> instead of returning null\n2. Add @NonNull/@Nullable annotations (JetBrains or Lombok)\n3. Use Objects.requireNonNull() for mandatory parameters\n4. Consider using a linter like SpotBugs to detect null dereferences",
-                "learn_more": "Study Java Optional class (JDK 8+), JSR-305 null annotations, and the NullAway static analyzer",
-                "code_before": "public String getUserName(User user) {\n    return user.getProfile().getName();\n}",
-                "code_after": "public Optional<String> getUserName(User user) {\n    return Optional.ofNullable(user)\n        .map(User::getProfile)\n        .map(Profile::getName);\n}",
-            },
-            {
-                "id": "j2", "severity": "MEDIUM", "category": "Quality",
-                "title": "Missing input validation in Spring controllers",
-                "file": "Controller classes",
-                "what_is_it": "REST controller endpoints accept user input without validating format, length, or content using Bean Validation annotations.",
-                "why_it_happens": "Validation is often added as an afterthought, or developers rely on database constraints instead of catching invalid input early at the API layer.",
-                "why_it_matters": "Invalid input can cause database errors, unexpected behavior in business logic, security vulnerabilities (XSS, injection), and poor user experience.",
-                "how_to_fix": "1. Add @Valid to controller method parameters\n2. Use @NotNull, @Size, @Email, @Pattern on DTO fields\n3. Create a global @ExceptionHandler for MethodArgumentNotValidException\n4. Return structured validation error responses",
-                "learn_more": "Study Spring Validation with Hibernate Validator, Jakarta Bean Validation 3.0 specification",
-                "code_before": "@PostMapping(\"/users\")\npublic User createUser(@RequestBody UserDto dto) {\n    return userService.create(dto);\n}",
-                "code_after": "@PostMapping(\"/users\")\npublic User createUser(@Valid @RequestBody UserDto dto) {\n    return userService.create(dto);\n}\n// In UserDto:\n@NotBlank @Size(min=2, max=50)\nprivate String name;\n@Email @NotBlank\nprivate String email;",
-            },
-        ],
-        "JavaScript": [
-            {
-                "id": "js1", "severity": "HIGH", "category": "Security",
-                "title": "Potential XSS via innerHTML usage",
-                "file": "Frontend JavaScript files",
-                "what_is_it": "Using innerHTML to insert content from user input or external sources allows attackers to inject malicious HTML and JavaScript into your page.",
-                "why_it_happens": "innerHTML is the easiest way to dynamically add HTML. Developers use it without realizing it executes any <script> tags or event handlers in the inserted string.",
-                "why_it_matters": "An attacker can inject <script>document.cookie</script> to steal session cookies, redirect users to phishing sites, or perform actions as the logged-in user.",
-                "how_to_fix": "1. Replace innerHTML with textContent for plain text\n2. Use createElement/appendChild for dynamic HTML\n3. If you must use innerHTML, sanitize with DOMPurify first\n4. Enable Content Security Policy (CSP) headers",
-                "learn_more": "Read OWASP XSS Prevention Cheat Sheet and the DOMPurify library documentation",
-                "code_before": "// Dangerous\ndiv.innerHTML = userInput;\ndiv.innerHTML = `<h1>${req.params.name}</h1>`;",
-                "code_after": "// Safe for text\ndiv.textContent = userInput;\n\n// Safe for HTML — sanitize first\nimport DOMPurify from 'dompurify';\ndiv.innerHTML = DOMPurify.sanitize(userInput);",
-            },
-        ],
-        "TypeScript": [
-            {
-                "id": "ts1", "severity": "MEDIUM", "category": "Quality",
-                "title": "Overuse of 'any' type defeats TypeScript safety",
-                "file": "Multiple TypeScript files",
-                "what_is_it": "Using the 'any' type tells TypeScript to skip type checking for a variable, effectively turning off the main benefit of TypeScript for that code path.",
-                "why_it_happens": "When migrating from JavaScript or dealing with complex third-party types, using 'any' is a quick way to silence TypeScript errors without understanding the proper type.",
-                "why_it_matters": "Code using 'any' can have type-related bugs that TypeScript would normally catch — null access, wrong method calls, incorrect argument types — all invisible until runtime.",
-                "how_to_fix": "1. Enable strict: true in tsconfig.json\n2. Enable noImplicitAny: true\n3. Replace 'any' with 'unknown' when type is truly unknown\n4. Use generics <T> for flexible but still type-safe code\n5. Use type assertions (as Type) only when you are certain",
-                "learn_more": "Read the TypeScript Handbook on 'unknown vs any' and TypeScript strict mode documentation",
-                "code_before": "function processData(data: any): any {\n    return data.value.nested;\n}",
-                "code_after": "interface DataShape {\n    value: { nested: string };\n}\nfunction processData(data: DataShape): string {\n    return data.value.nested;\n}",
-            },
-        ],
-    }
+    # Security + basic quality scan on each file
+    for fname, content in sections.items():
+        for pattern, sev, title, desc, fix in _SEC:
+            m = re.search(pattern, content, re.MULTILINE)
+            if m:
+                line = content[:m.start()].count('\n') + 1
+                findings.append({
+                    "id": nid(), "severity": sev, "category": "Security",
+                    "title": title,
+                    "description": f"{desc} Found in {fname}.",
+                    "file": f"{fname}:{line}",
+                    "fix": fix, "code_example": "",
+                })
+                files_with_issues.add(fname)
 
-    # Get language-specific findings or generic ones
-    specific = lang_findings.get(lang, [])
-    generic_findings = [
-        {
-            "id": "g1", "severity": "MEDIUM", "category": "Documentation",
-            "title": "Insufficient inline documentation",
-            "file": "Multiple source files",
-            "what_is_it": f"Public functions and classes in this {lang} project lack descriptive comments and documentation explaining their purpose, parameters, and return values.",
-            "why_it_happens": "Documentation is treated as optional during fast development cycles. There is social pressure to ship features, and documentation has no immediate functional impact.",
-            "why_it_matters": "New team members spend hours reverse-engineering undocumented code. Future-you will not remember what a complex function does in 6 months. IDEs show no hints on hover.",
-            "how_to_fix": "1. Document every public function before merging PRs\n2. Explain WHY the code does what it does, not just WHAT it does\n3. Document edge cases, null returns, and thrown exceptions\n4. Set up a linter rule to enforce documentation coverage",
-            "learn_more": f"Study the {lang} documentation standards for your ecosystem (JSDoc, JavaDoc, Python docstrings, etc.)",
-            "code_before": f"# No documentation\ndef calculate(x, y, mode):\n    if mode == 1:\n        return x * y * 0.4\n    return x + y",
-            "code_after": f'def calculate(x: float, y: float, mode: int) -> float:\n    """Calculate a weighted or summed result.\n\n    Args:\n        x: First operand.\n        y: Second operand.\n        mode: 1 for weighted product, 0 for sum.\n\n    Returns:\n        Weighted product (mode=1) or simple sum.\n    """\n    if mode == 1:\n        return x * y * 0.4\n    return x + y',
-        },
-        {
-            "id": "g2", "severity": "LOW", "category": "Quality",
-            "title": "No automated testing detected",
+        # TODO/FIXME check
+        todos = re.findall(r'(TODO|FIXME|HACK|XXX)', content)
+        if len(todos) >= 3:
+            findings.append({
+                "id": nid(), "severity": "LOW", "category": "Quality",
+                "title": f"Unresolved TODOs ({len(todos)} found)",
+                "description": f"{len(todos)} TODO/FIXME comments in {fname} indicate unfinished work.",
+                "file": fname, "fix": "Create issues in your tracker and remove inline comments.", "code_example": "",
+            })
+
+    # Dependency scan - requirements.txt
+    req_content = sections.get("requirements.txt", "") or sections.get("Pipfile", "")
+    if req_content:
+        for pkg, (safe_ver, cve, sev, note) in _PY_VULNS.items():
+            m = re.search(rf'(?i)^{re.escape(pkg)}\s*[=<>!]=?\s*([\d.]+)', req_content, re.MULTILINE)
+            if m:
+                ver = m.group(1)
+                if not ver.startswith(safe_ver):
+                    cve_s = f" ({cve})" if cve else ""
+                    findings.append({
+                        "id": nid(), "severity": sev, "category": "Dependency",
+                        "title": f"Vulnerable: {pkg}=={ver}",
+                        "description": f"{pkg}=={ver} has security issues{cve_s}. {note}",
+                        "file": "requirements.txt",
+                        "fix": f"Upgrade: {pkg}>={safe_ver}",
+                        "code_example": f"# requirements.txt\n{pkg}>={safe_ver}",
+                    })
+
+    # Dependency scan - package.json
+    pkg_content = sections.get("package.json", "")
+    if pkg_content:
+        try:
+            pkg_data = json.loads(pkg_content)
+            all_deps = {**pkg_data.get("dependencies",{}), **pkg_data.get("devDependencies",{})}
+            for pkg, (safe_ver, cve, sev, note) in _JS_VULNS.items():
+                if pkg in all_deps:
+                    ver = re.sub(r'[^0-9.]', '', all_deps[pkg])
+                    if ver and not ver.startswith(safe_ver.split('.')[0]):
+                        cve_s = f" ({cve})" if cve else ""
+                        findings.append({
+                            "id": nid(), "severity": sev, "category": "Dependency",
+                            "title": f"Vulnerable npm: {pkg}",
+                            "description": f"{pkg} has known issues{cve_s}. {note}",
+                            "file": "package.json",
+                            "fix": f"npm install {pkg}@latest",
+                            "code_example": f'"{pkg}": ">={safe_ver}"',
+                        })
+        except Exception:
+            pass
+
+    # Structural checks using file tree
+    src_files  = [f for f in tree if re.search(r'\.(py|js|ts|go|java|rb|rs|cpp)$', f)]
+    test_files = [f for f in tree if re.search(r'(test|spec|__tests__)', f, re.I)]
+    has_ci     = any(('.github/workflows' in f or 'gitlab-ci' in f or 'Jenkinsfile' in f) for f in tree)
+    has_readme = req.has_readme or any(re.search(r'readme', f, re.I) for f in tree)
+    has_docker = any(f == 'Dockerfile' or f.endswith('/Dockerfile') for f in tree)
+
+    if src_files and not test_files:
+        findings.append({
+            "id": nid(), "severity": "MEDIUM", "category": "Quality",
+            "title": "No Test Files Found",
+            "description": f"{len(src_files)} source files but zero test files detected. Untested code is fragile.",
             "file": "Repository root",
-            "what_is_it": "The repository appears to have low or no automated test coverage, meaning code changes are only verified manually.",
-            "why_it_happens": "Writing tests takes time that is often deprioritized under deadline pressure. Many developers are never taught test-driven development in school.",
-            "why_it_matters": "Without tests, every code change might silently break existing functionality. Refactoring becomes dangerous. Bugs only surface in production where they affect real users.",
-            "how_to_fix": "1. Start with the most critical functions — authentication, payments, data writes\n2. Write at least one happy-path test and one error-path test per function\n3. Set a minimum coverage threshold (e.g. 70%) in your CI pipeline\n4. Use mocks/stubs to isolate units from external dependencies",
-            "learn_more": "Study Test-Driven Development (TDD) by Kent Beck, and the testing framework for your language (pytest, JUnit, Jest, etc.)",
-            "code_before": "# No tests exist for this critical function\ndef transfer_funds(from_account, to_account, amount):\n    ...",
-            "code_after": "# test_transfers.py\ndef test_transfer_funds_success():\n    acc1 = Account(balance=1000)\n    acc2 = Account(balance=0)\n    transfer_funds(acc1, acc2, 500)\n    assert acc1.balance == 500\n    assert acc2.balance == 500\n\ndef test_transfer_funds_insufficient_balance():\n    acc1 = Account(balance=100)\n    with pytest.raises(InsufficientFundsError):\n        transfer_funds(acc1, Account(balance=0), 500)",
-        },
+            "fix": "Create a tests/ folder. Use pytest (Python) or jest (JS).",
+            "code_example": "pip install pytest\n\n# tests/test_basic.py\ndef test_example():\n    assert 1 + 1 == 2",
+        })
+
+    if src_files and not has_ci:
+        findings.append({
+            "id": nid(), "severity": "LOW", "category": "Quality",
+            "title": "No CI/CD Pipeline",
+            "description": "No GitHub Actions, GitLab CI or similar automation detected.",
+            "file": "Repository root",
+            "fix": "Add .github/workflows/ci.yml to run tests on every push.",
+            "code_example": "name: CI\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n      - run: pip install -r requirements.txt && pytest",
+        })
+
+    if not has_readme and src_files:
+        findings.append({
+            "id": nid(), "severity": "LOW", "category": "Documentation",
+            "title": "No README File",
+            "description": "Repository has no README. Contributors won't know how to set up the project.",
+            "file": "Repository root",
+            "fix": "Add README.md with project description, setup steps, and usage examples.",
+            "code_example": "# Project Name\n\n## Setup\n```bash\npip install -r requirements.txt\n```\n\n## Usage\n...",
+        })
+
+    # Calculate scores
+    def deduct(items, category):
+        w = {"CRITICAL": 20, "HIGH": 12, "MEDIUM": 6, "LOW": 2}
+        return sum(w.get(f["severity"], 0) for f in items if f["category"] == category)
+
+    sec_score  = max(0, min(100, 100 - deduct(findings, "Security")))
+    qual_score = max(0, min(100, (80 if test_files else 55) - deduct(findings, "Quality")))
+    dep_score  = max(0, min(100, (85 if has_ci else 75) - deduct(findings, "Dependency")))
+    doc_score  = max(0, min(100, (70 if has_readme else 45) - deduct(findings, "Documentation")))
+    health     = round(sec_score*0.35 + qual_score*0.30 + dep_score*0.20 + doc_score*0.15)
+
+    status = "Healthy" if health >= 80 else "Moderate" if health >= 60 else "Degraded" if health >= 40 else "At Risk"
+    total  = len(findings)
+    crit   = sum(1 for f in findings if f["severity"] == "CRITICAL")
+    high   = sum(1 for f in findings if f["severity"] == "HIGH")
+    name   = f"{req.owner}/{req.repo}"
+    fc     = req.file_count
+
+    if total == 0:
+        summary = f"{name} passed all automated checks with no issues detected across {fc} files. Code quality, security, and dependencies look clean."
+    else:
+        summary = (f"{name} has {total} issue{'s' if total!=1 else ''} across {fc} files "
+                   f"({crit} critical, {high} high). Security: {sec_score}/100. "
+                   f"{'Fix critical issues immediately.' if crit > 0 else 'No critical security issues.'}")
+
+    # Agent logs
+    sec_f = [f for f in findings if f["category"]=="Security"]
+    dep_f = [f for f in findings if f["category"]=="Dependency"]
+    qual_f= [f for f in findings if f["category"]=="Quality"]
+    doc_f = [f for f in findings if f["category"]=="Documentation"]
+
+    logs = [
+        {"agent":"Orchestrator",      "msg":f"Scanning {name} — {fc} files indexed",         "status":"running"},
+        {"agent":"Security Scout",    "msg":f"Running {len(_SEC)} security pattern checks...", "status":"running"},
     ]
+    for f in sec_f[:3]:
+        logs.append({"agent":"Security Scout","msg":f"{f['severity']}: {f['title']} ({f['file']})","status":"alert" if f["severity"] in ("CRITICAL","HIGH") else "warn"})
+    logs.append({"agent":"Security Scout","msg":"Security scan complete" if not sec_f else f"{len(sec_f)} issues found","status":"success" if not sec_f else "warn"})
+    logs.append({"agent":"Quality Architect","msg":"Analysing code structure and tests...","status":"running"})
+    for f in qual_f[:2]:
+        logs.append({"agent":"Quality Architect","msg":f.get("title","Issue found"),"status":"warn"})
+    logs.append({"agent":"Dependency Warden","msg":"Checking CVE database...","status":"running"})
+    for f in dep_f[:2]:
+        logs.append({"agent":"Dependency Warden","msg":f"{f['severity']}: {f['title']}","status":"alert" if f["severity"]=="HIGH" else "warn"})
+    logs.append({"agent":"Docs Specialist","msg":f"{len(doc_f)} documentation issues" if doc_f else "Docs OK","status":"warn" if doc_f else "success"})
+    if any(f.get("fix") for f in (sec_f+dep_f)[:3]):
+        logs.append({"agent":"AI Fix Agent","msg":f"Fix suggestions ready for {sum(1 for f in findings if f.get('fix'))} issues","status":"success"})
+    logs.append({"agent":"Orchestrator","msg":f"Analysis complete. Health Score: {health}/100","status":"success"})
 
-    all_findings = specific + generic_findings
+    # Quantum risk
+    qr_files = {}
+    for f in findings:
+        fname = f["file"].split(':')[0]
+        w = {"CRITICAL":0.4,"HIGH":0.25,"MEDIUM":0.15,"LOW":0.05}.get(f["severity"],0)
+        qr_files[fname] = min(1.0, qr_files.get(fname, 0.1) + w)
+    for path in tree:
+        if re.search(r'\.(py|js|ts|go|java)$', path) and path not in qr_files:
+            qr_files[path] = 0.05
+    quantum_risk = []
+    for fname, score in sorted(qr_files.items(), key=lambda x:x[1], reverse=True)[:8]:
+        lvl = "HIGH" if score>=0.5 else "MEDIUM" if score>=0.25 else "LOW"
+        related = [f["title"] for f in findings if f["file"].split(':')[0]==fname][:3]
+        quantum_risk.append({"file":fname,"risk_score":round(score,3),"risk_level":lvl,"factors":related or ["No issues detected"]})
 
-    digital_twin = {
-        "architecture_summary": f"This is a {lang} project with {issues_count} open issues. The codebase structure follows standard {lang} conventions. Key risk areas are authentication, data access, and input validation layers.",
-        "files": [
-            {"name": "main entry point", "role": "Application bootstrap and configuration loading", "type": "entry", "dependents": [], "dependencies": ["config", "routes"], "change_impact": "Changes here affect the entire application startup sequence", "risk": "high"},
-            {"name": "authentication module", "role": "Handles user login, session management, and access control", "type": "core", "dependents": ["routes", "middleware"], "dependencies": ["database", "config"], "change_impact": "Any change to auth logic can lock out users or create security holes", "risk": "high"},
-            {"name": "database layer", "role": "All database connections, queries, and data models", "type": "core", "dependents": ["auth", "business logic"], "dependencies": ["config"], "change_impact": "Schema or query changes ripple through all modules that read/write data", "risk": "high"},
-            {"name": "configuration", "role": "Environment variables, secrets, and app settings", "type": "config", "dependents": ["all modules"], "dependencies": [], "change_impact": "Wrong config crashes the entire application at startup", "risk": "medium"},
-        ],
-        "impact_chains": [
-            {"trigger_file": "configuration", "chain": ["database layer", "authentication module", "all routes"], "blast_radius": "high", "scenario": "If configuration changes (wrong DB host, missing secret key), the database connection fails, authentication cannot verify users, and all protected API routes return 500 errors — complete outage."},
-            {"trigger_file": "authentication module", "chain": ["protected routes", "user sessions"], "blast_radius": "high", "scenario": "If authentication logic changes (e.g., token validation rules), all currently logged-in users may get logged out, and new logins may silently fail depending on the change."},
-        ],
-    }
-
-    quantum_risk = [
-        {"file": "authentication module", "risk_score": 0.85, "risk_level": "HIGH", "factors": ["Central dependency", "Security-critical", "High coupling"], "explanation": "Authentication is the gateway to your entire application — any vulnerability here compromises all users."},
-        {"file": "database layer", "risk_score": 0.78, "risk_level": "HIGH", "factors": ["All data flows through here", "SQL injection surface", "No tests detected"], "explanation": "Every piece of data your app reads or writes passes through this layer, making it the highest-impact attack surface."},
-        {"file": "main entry point", "risk_score": 0.55, "risk_level": "MEDIUM", "factors": ["Config loading", "Startup sequence"], "explanation": "Problems here prevent the app from starting at all — crashes are total but usually obvious and fast to diagnose."},
-        {"file": "API routes", "risk_score": 0.48, "risk_level": "MEDIUM", "factors": ["Input validation", "External interface", "Error handling"], "explanation": "Direct interface with untrusted external input — missing validation here is the entry point for most web attacks."},
-    ]
-
-    agent_logs = [
-        {"agent": "Orchestrator", "msg": f"Analysing {req.repo_name} — building structure model", "status": "running"},
-        {"agent": "Security Scout", "msg": f"Scanning {lang} project for common vulnerability patterns", "status": "running"},
-        {"agent": "Security Scout", "msg": f"Identified {len([f for f in all_findings if f['severity'] in ('CRITICAL','HIGH')])} high-priority security findings", "status": "alert" if any(f['severity'] in ('CRITICAL','HIGH') for f in all_findings) else "success"},
-        {"agent": "Quality Architect", "msg": "Evaluating code structure, complexity, and documentation coverage", "status": "running"},
-        {"agent": "Quality Architect", "msg": f"Quality score: {quality_score}/100 — {issues_count} open issues tracked", "status": "warn" if quality_score < 70 else "success"},
-        {"agent": "Dependency Warden", "msg": f"Checking {lang} dependency manifest for known CVEs", "status": "running"},
-        {"agent": "Dependency Warden", "msg": "Dependency audit complete", "status": "success"},
-        {"agent": "Docs Specialist", "msg": f"Documentation coverage estimated at {doc_score}%", "status": "warn" if doc_score < 60 else "success"},
-        {"agent": "AI Fix Agent", "msg": "Generating educational explanations for all findings", "status": "running"},
-        {"agent": "AI Fix Agent", "msg": f"Educational content generated for {len(all_findings)} findings", "status": "success"},
-        {"agent": "Orchestrator", "msg": f"Analysis complete. Health Score: {health_score}/100", "status": "success" if health_score >= 70 else "warn"},
-    ]
+    # Digital twin
+    critical_files = list(set(f["file"].split(':')[0] for f in findings if f["severity"] in ("CRITICAL","HIGH")))[:5]
+    dep_map = {}
+    for f in src_files[:6]:
+        parts = [p for p in re.split(r'[/_.]', f) if len(p)>3]
+        deps  = [g for g in src_files if g!=f and any(p in g for p in parts)][:3]
+        if deps:
+            dep_map[f] = deps
 
     return {
-        "health_score": health_score,
-        "security_score": security_score,
-        "quality_score": quality_score,
-        "dependency_score": dep_score,
-        "documentation_score": doc_score,
-        "status": "Healthy" if health_score >= 80 else "Moderate" if health_score >= 60 else "Degraded" if health_score >= 40 else "At Risk",
-        "summary": f"This {lang} repository has a health score of {health_score}/100. {len([f for f in all_findings if f['severity'] in ('CRITICAL','HIGH')])} high-priority issues were found requiring attention. Focus on security hardening and improving documentation coverage.",
-        "findings": all_findings,
-        "quantum_risk": quantum_risk,
-        "digital_twin": digital_twin,
-        "agent_logs": agent_logs,
-        "source": "rule-based",
+        "health_score":       health,
+        "security_score":     sec_score,
+        "quality_score":      qual_score,
+        "dependency_score":   dep_score,
+        "documentation_score":doc_score,
+        "status":             status,
+        "summary":            summary,
+        "findings":           findings,
+        "quantum_risk":       quantum_risk,
+        "digital_twin":       {"critical_files":critical_files,"dependency_map":dep_map,"impact_summary":summary[:200]},
+        "agent_logs":         logs,
+        "_engine":            "rule-based",
     }
 
 
-# ─────────────────────────────────────────────────────────
-# NEW ROUTE: /analyze-repo  (proxies Anthropic, CORS safe)
-# ─────────────────────────────────────────────────────────
+# ==========================================================================
+# Routes
+# ==========================================================================
 
-ANALYSIS_PROMPT = """You are RepoGuardian AI — an expert code educator and security analyst. Analyze this GitHub repository and produce a deeply educational report that TEACHES developers, not just lists issues.
+@app.get("/ping")
+def ping():
+    return {"status":"online","service":"RepoGuardian AI v3.3","ts":datetime.utcnow().isoformat()}
 
-Repository: {repo_name}
-Language: {language}
-Stars: {stars}
-Open Issues: {open_issues}
-Size: {size} KB
-Topics: {topics}
-Description: {description}
-Default Branch: {default_branch}
 
-Return ONLY valid JSON (no markdown, no backticks) in this exact format:
-{{
-  "health_score": <0-100>,
-  "security_score": <0-100>,
-  "quality_score": <0-100>,
-  "dependency_score": <0-100>,
-  "documentation_score": <0-100>,
-  "status": "Healthy|Moderate|Degraded|At Risk",
-  "summary": "<2-3 sentence summary>",
-  "findings": [
-    {{
-      "id": "f1",
-      "severity": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
-      "category": "Security|Quality|Dependency|Documentation",
-      "title": "<short title>",
-      "file": "<filename:line or N/A>",
-      "what_is_it": "<plain English: what this issue IS>",
-      "why_it_happens": "<why developers make this mistake>",
-      "why_it_matters": "<real-world impact and consequences>",
-      "how_to_fix": "<numbered step-by-step fix>",
-      "learn_more": "<concept to study>",
-      "code_before": "<bad code 3-8 lines or empty>",
-      "code_after": "<fixed code 3-8 lines or empty>"
-    }}
-  ],
-  "quantum_risk": [
-    {{
-      "file": "<filename>",
-      "risk_score": <0.0-1.0>,
-      "risk_level": "HIGH|MEDIUM|LOW",
-      "factors": ["<factor>"],
-      "explanation": "<plain English reason>"
-    }}
-  ],
-  "digital_twin": {{
-    "architecture_summary": "<2-3 sentences on codebase structure>",
-    "files": [
-      {{
-        "name": "<filename>",
-        "role": "<what it does>",
-        "type": "entry|core|utility|config|test",
-        "dependents": ["<file>"],
-        "dependencies": ["<file>"],
-        "change_impact": "<what breaks if changed>",
-        "risk": "high|medium|low"
-      }}
-    ],
-    "impact_chains": [
-      {{
-        "trigger_file": "<file>",
-        "chain": ["<file1>", "<file2>"],
-        "scenario": "<real consequence>",
-        "blast_radius": "high|medium|low"
-      }}
-    ]
-  }},
-  "agent_logs": [
-    {{"agent": "<name>", "msg": "<message>", "status": "running|alert|warn|success"}}
-  ]
-}}
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest, bg: BackgroundTasks):
+    if not _AGENTS_OK:
+        return {"status":"skipped","message":"agents.py not available"}
+    def _run():
+        result = analyse_repository(req.repo_url, use_mock=req.use_mock)
+        _cache[req.repo_url] = result
+    bg.add_task(_run)
+    return {"status":"queued","repo":req.repo_url}
 
-Generate 5-7 findings with rich educational content specific to {language}. Make 10-12 agent_logs.
-"""
+
+@app.get("/health-status")
+def get_health_status(repo_url: Optional[str] = None):
+    if repo_url and repo_url in _cache:
+        r = _cache[repo_url]
+    elif repo_url:
+        return {"status":"no_analysis","repo":repo_url,"health_score":None,"findings":[],"summary":{},"agent_logs":[],"message":"Not yet analysed."}
+    elif _cache:
+        r = list(_cache.values())[-1]
+    else:
+        return {"status":"no_analysis","health_score":None,"findings":[],"summary":{},"agent_logs":[],"message":"No repos analysed yet."}
+    return {"status":"complete","repo":r.repo,"health_score":r.health_score,"findings":r.findings,"summary":r.summary,"agent_logs":r.agent_logs,"grade":_grade(r.health_score),"last_updated":datetime.utcnow().isoformat()}
+
 
 @app.post("/analyze-repo")
 async def analyze_repo(req: RepoAnalyzeRequest):
     """
-    Main analysis endpoint called by the frontend.
-    Tries Anthropic Claude API first, falls back to rule-based engine.
+    Main frontend endpoint.
+    1. Empty repo -> instant result
+    2. Anthropic key + credits -> Claude AI
+    3. Fallback -> built-in rule-based engine
     """
-    cache_key = req.repo_name
-    if cache_key in _analysis_cache:
-        return _analysis_cache[cache_key]
 
-    # Try Anthropic API if key is configured
-    if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY.startswith("sk-ant-"):
-        prompt = ANALYSIS_PROMPT.format(
-            repo_name=req.repo_name,
-            language=req.language,
-            stars=req.stars,
-            open_issues=req.open_issues,
-            size=req.size,
-            topics=", ".join(req.topics) if req.topics else "none",
-            description=req.description,
-            default_branch=req.default_branch,
-        )
+    # 1. Empty
+    if req.is_empty or req.file_count == 0:
+        return _empty_result(req)
+
+    # 2. Try Anthropic
+    api_key = os.getenv("ANTHROPIC_API_KEY","").strip()
+    if api_key and not api_key.startswith("sk-ant-your"):
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-sonnet-4-20250514",
-                        "max_tokens": 3000,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                )
-            if resp.status_code == 200:
-                data = resp.json()
-                text = "".join(c.get("text", "") for c in data.get("content", []))
-                text = text.replace("```json", "").replace("```", "").strip()
-                result = json.loads(text)
-                result["source"] = "anthropic"
-                _analysis_cache[cache_key] = result
-                return result
-            else:
-                print(f"[Anthropic] HTTP {resp.status_code}: {resp.text[:200]} - falling back to rule-based engine")
+            result = await _call_anthropic(api_key, req)
+            result["_engine"] = "claude-ai"
+            return result
         except Exception as e:
-            print(f"[Anthropic] Error: {e} - falling back to rule-based engine")
+            print(f"[Anthropic] {str(e)[:150]} - falling back to rule-based engine")
 
-    # Fallback: rule-based analysis (always works)
-    result = rule_based_analysis(req)
-    _analysis_cache[cache_key] = result
+    # 3. Rule-based (always works)
+    return _rule_based_analysis(req.file_context, req.tree, req)
+
+
+async def _call_anthropic(api_key: str, req: RepoAnalyzeRequest) -> dict:
+    prompt = f"""Analyse {req.owner}/{req.repo} and return ONLY valid JSON (no markdown):
+Language:{req.language} | Size:{req.size}KB | Files:{req.file_count} | Tests:{req.has_tests} | CI:{req.has_ci}
+Topics:{','.join(req.topics)} | Desc:{req.description}
+
+FILE CONTENT:
+{req.file_context[:5000]}
+
+Rules: only report issues you actually see. Empty/simple repos score HIGH (85+).
+security_score start 100 (-20 CRIT,-12 HIGH,-6 MED,-2 LOW), quality start {80 if req.has_tests else 55},
+dependency start {85 if req.has_ci else 75}, docs start {70 if req.has_readme else 45}.
+health = sec*0.35+qual*0.30+dep*0.20+doc*0.15
+
+JSON shape: {{"health_score":0,"security_score":0,"quality_score":0,"dependency_score":0,"documentation_score":0,"status":"Healthy","summary":"","findings":[],"quantum_risk":[],"digital_twin":{{"critical_files":[],"dependency_map":{{}},"impact_summary":""}},"agent_logs":[]}}"""
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+    def _sync_post():
+        return requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":api_key,"anthropic-version":"2023-06-01","content-type":"application/json"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":2500,"messages":[{"role":"user","content":prompt}]},
+            timeout=60,
+        )
+    r = await loop.run_in_executor(None, _sync_post)
+
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}: {r.text[:200]}")
+
+    text = "".join(b.get("text","") for b in r.json().get("content",[]))
+    clean = re.sub(r'```(?:json)?','',text).strip()
+    try:
+        result = json.loads(clean)
+    except Exception:
+        m = re.search(r'\{[\s\S]*\}', clean)
+        if not m:
+            raise Exception("Non-JSON Anthropic response")
+        result = json.loads(m.group(0))
+
+    for k in ["health_score","security_score","quality_score","dependency_score","documentation_score"]:
+        result[k] = max(0,min(100,round(float(result.get(k,0)))))
+    result["health_score"] = round(result["security_score"]*0.35+result["quality_score"]*0.30+result["dependency_score"]*0.20+result["documentation_score"]*0.15)
     return result
 
 
-# ─────────────────────────────────────────────────────────
-# Existing routes
-# ─────────────────────────────────────────────────────────
+def _empty_result(req: RepoAnalyzeRequest) -> dict:
+    return {
+        "health_score":100,"security_score":100,"quality_score":100,
+        "dependency_score":100,"documentation_score":70 if req.has_readme else 20,
+        "status":"Healthy",
+        "summary":f"{req.owner}/{req.repo} is empty — no source files to analyse. Push code to get a real report.",
+        "findings":[],"quantum_risk":[],
+        "digital_twin":{"critical_files":[],"dependency_map":{},"impact_summary":"No files yet."},
+        "agent_logs":[
+            {"agent":"Orchestrator",      "msg":f"Scanning {req.owner}/{req.repo}...",   "status":"running"},
+            {"agent":"Orchestrator",      "msg":"Repository appears to be empty.",        "status":"warn"},
+            {"agent":"Security Scout",    "msg":"No source files — scan skipped.",        "status":"success"},
+            {"agent":"Quality Architect", "msg":"No source files — scan skipped.",        "status":"success"},
+            {"agent":"Dependency Warden", "msg":"No dependency manifests found.",         "status":"success"},
+            {"agent":"Docs Specialist",   "msg":"README detected." if req.has_readme else "No README found.","status":"success" if req.has_readme else "warn"},
+            {"agent":"Orchestrator",      "msg":"Analysis complete. Health Score: 100/100","status":"success"},
+        ],
+        "_isEmpty":True,"_engine":"empty-repo",
+    }
 
-MOCK_FILES_FOR_QUANTUM = [
-    {"path": "src/auth/jwt.py",        "complexity": 18, "churn": 42, "coupling": 9,  "has_tests": False},
-    {"path": "src/db/queries.py",       "complexity": 12, "churn": 31, "coupling": 14, "has_tests": False},
-    {"path": "src/api/routes.py",       "complexity": 8,  "churn": 55, "coupling": 7,  "has_tests": True},
-    {"path": "src/utils/helpers.py",    "complexity": 4,  "churn": 8,  "coupling": 3,  "has_tests": True},
-    {"path": "src/ml/model_train.py",   "complexity": 22, "churn": 19, "coupling": 6,  "has_tests": False},
-    {"path": "src/auth/middleware.py",  "complexity": 14, "churn": 38, "coupling": 11, "has_tests": False},
-]
 
-@app.get("/ping")
-def ping():
-    return {"status": "online", "service": "RepoGuardian AI", "ts": datetime.utcnow().isoformat()}
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest, bg: BackgroundTasks):
-    def _run():
-        result = analyse_repository(req.repo_url, use_mock=req.use_mock)
-        _analysis_cache[req.repo_url] = result
-    bg.add_task(_run)
-    return {"status": "queued", "repo": req.repo_url, "message": "Analysis started. Poll /health for results."}
-
-@app.get("/health")
-def get_health(repo_url: Optional[str] = None):
-    if repo_url and repo_url in _analysis_cache:
-        r = _analysis_cache[repo_url]
-    elif _analysis_cache:
-        r = list(_analysis_cache.values())[-1]
-    else:
-        r = run_mock_analysis("kluniversity/auth-service")
-    return {"repo": r.repo, "health_score": r.health_score, "findings": r.findings, "summary": r.summary, "agent_logs": r.agent_logs, "last_updated": datetime.utcnow().isoformat()}
-
+# Simulation + Quantum endpoints
 @app.post("/simulation")
 def run_simulation(req: SimulationRequest):
-    graph  = build_mock_graph()
-    result = simulate_impact(graph, req.changed_file)
-    return result
+    if not _DT_OK:
+        return {"changed_file":req.changed_file,"direct_impact":[],"indirect_impact":[],"safe_files":[],"stats":{"total_files":0,"affected_count":0,"safe_count":0}}
+    return simulate_impact(build_mock_graph(), req.changed_file)
+
 
 @app.get("/quantum-risk")
 def quantum_risk(repo_url: Optional[str] = None):
-    profiles = calculate_quantum_risk(MOCK_FILES_FOR_QUANTUM)
-    return {"repo": repo_url or "mock-repo", "profiles": [{"path": p.path, "risk_score": p.risk_score, "risk_level": p.risk_level, "dominant_factor": p.dominant_factor} for p in profiles]}
+    if not _QR_OK:
+        return {"repo":repo_url or "demo","profiles":[],"computed_at":datetime.utcnow().isoformat()}
+    MOCK = [
+        {"path":"src/auth/jwt.py","complexity":18,"churn":42,"coupling":9,"has_tests":False},
+        {"path":"src/db/queries.py","complexity":12,"churn":31,"coupling":14,"has_tests":False},
+        {"path":"src/api/routes.py","complexity":8,"churn":55,"coupling":7,"has_tests":True},
+        {"path":"src/utils/helpers.py","complexity":4,"churn":8,"coupling":3,"has_tests":True},
+        {"path":"src/auth/middleware.py","complexity":14,"churn":38,"coupling":11,"has_tests":False},
+    ]
+    profiles = calculate_quantum_risk(MOCK)
+    return {"repo":repo_url or "demo","computed_at":datetime.utcnow().isoformat(),
+            "profiles":[{"path":p.path,"risk_score":p.risk_score,"risk_level":p.risk_level,"dominant_factor":p.dominant_factor,"amplitude_vector":p.amplitude_vector} for p in profiles]}
 
-@app.get("/simulation/files")
-def list_simulatable_files():
-    graph = build_mock_graph()
-    return {"files": sorted(graph.nodes())}
 
 @app.get("/agent-logs")
-async def stream_agent_logs():
-    import json as _json
-    async def event_generator():
+async def stream_logs():
+    async def gen():
         for log in MOCK_AGENT_LOGS:
-            yield f"data: {_json.dumps(log)}\n\n"
+            yield f"data: {json.dumps(log)}\n\n"
             await asyncio.sleep(1.2)
-        yield "data: {\"agent\":\"Orchestrator\",\"msg\":\"Stream complete.\",\"status\":\"success\"}\n\n"
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        yield 'data: {"agent":"Orchestrator","msg":"Stream complete.","status":"success"}\n\n'
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/simulation/files")
+def list_files():
+    if not _DT_OK:
+        return {"files":[]}
+    return {"files":sorted(build_mock_graph().nodes())}
+
+
+def _grade(s):
+    return "A" if s>=90 else "B" if s>=80 else "C" if s>=70 else "D" if s>=55 else "F"
+
 
 if __name__ == "__main__":
     import uvicorn
