@@ -519,67 +519,7 @@ export default function RepoDetail() {
                     </div>
                   </div>
                 </div>
-                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
-
-  {/* Recent Commits */}
-  <div style={{ background:'var(--bg-2)', border:'1px solid var(--border)', borderRadius:6 }}>
-    <div style={{ padding:'10px 16px', borderBottom:'1px solid var(--border)', display:'flex', alignItems:'center', gap:8 }}>
-      <GitCommit style={{ width:14, height:14, color:'#a78bfa' }} />
-      <span style={{ fontSize:13, fontWeight:600 }}>Recent Commits</span>
-    </div>
-
-    <div style={{ padding:12, display:'flex', flexDirection:'column', gap:8 }}>
-      {(repoInfo?.commits || []).slice(0,5).map((c,i)=>(
-        <div key={i} style={{
-          padding:'8px 10px',
-          border:'1px solid var(--border)',
-          borderRadius:6,
-          background:'var(--bg-3)'
-        }}>
-          <div style={{ fontSize:12, color:'var(--text)', fontWeight:600 }}>
-            {c.commit?.message || 'Commit'}
-          </div>
-          <div style={{ fontSize:11, color:'var(--text-3)', fontFamily:'monospace' }}>
-            {c.sha?.slice(0,7)} • {new Date(c.commit?.author?.date).toLocaleString()}
-          </div>
-        </div>
-      ))}
-    </div>
-  </div>
-
-
-  {/* Agent File Checks */}
-  <div style={{ background:'var(--bg-2)', border:'1px solid var(--border)', borderRadius:6 }}>
-    <div style={{ padding:'10px 16px', borderBottom:'1px solid var(--border)', display:'flex', alignItems:'center', gap:8 }}>
-      <Cpu style={{ width:14, height:14, color:'#a78bfa' }} />
-      <span style={{ fontSize:13, fontWeight:600 }}>Agent File Checks</span>
-    </div>
-
-    <div style={{ padding:12, display:'flex', flexDirection:'column', gap:6 }}>
-      {(analysis?.digital_twin?.files || []).slice(0,6).map((f,i)=>(
-        <div key={i} style={{
-          display:'flex',
-          justifyContent:'space-between',
-          fontSize:12,
-          padding:'6px 8px',
-          borderRadius:4,
-          background:'var(--bg-3)',
-          border:'1px solid var(--border)'
-        }}>
-          <span style={{ fontFamily:'monospace', color:'#388bfd' }}>{f.name}</span>
-          <span style={{
-            color: f.risk === 'high' ? '#f85149' :
-                   f.risk === 'medium' ? '#d29922' : '#3fb950'
-          }}>
-            {f.risk?.toUpperCase()}
-          </span>
-        </div>
-      ))}
-    </div>
-  </div>
-
-</div>
-
+                <AgentLog externalLogs={analysis.agent_logs} />
                 <div style={{ display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12 }}>
                   {[
                     { label:'Critical', value:findings.filter(f=>f.severity==='CRITICAL').length, color:'#f85149' },
