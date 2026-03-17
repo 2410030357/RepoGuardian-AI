@@ -2,13 +2,13 @@
 
 ## What's New in v2.0
 
-- ✅ **Full routing** — All pages now work: Dashboard, Repositories, Repo Detail, Agent Logs, Settings
-- ✅ **GitHub sync** — Connect your GitHub Personal Access Token to see all your real repos
-- ✅ **AI Analysis** — Claude AI analyses each repo for security, quality, deps & docs
-- ✅ **Digital Twin** — Impact simulation showing what changes affect
-- ✅ **Quantum Risk** — Risk scoring per file with factor breakdown
-- ✅ **Agent Logs** — Live streaming log page with filtering
-- ✅ **Settings page** — GitHub connection management
+-  **Full routing** — All pages now work: Dashboard, Repositories, Repo Detail, Agent Logs, Settings
+-  **GitHub sync** — Connect your GitHub Personal Access Token to see all your real repos
+-  **AI Analysis** — Claude AI analyses each repo for security, quality, deps & docs
+-  **Digital Twin** — Impact simulation showing what changes affect
+-  **Quantum Risk** — Risk scoring per file with factor breakdown
+-  **Agent Logs** — Live streaming log page with filtering
+-  **Settings page** — GitHub connection management
 
 ## Quick Start
 
